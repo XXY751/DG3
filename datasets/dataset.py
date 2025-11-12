@@ -1,10 +1,26 @@
+# datasets/dataset.py (修改版)
 import torch
 from torch.utils.data import Dataset, DataLoader
 import numpy as np
-from utils.util import to_tensor
+# 确保 utils.util 存在且包含 to_tensor
+import torch
+from torch.utils.data import Dataset, DataLoader
+import numpy as np
 import os
 import random
-
+import datetime
+from types import SimpleNamespace # 确保导入 SimpleNamespace
+from pathlib import Path # <-- 修复：在这里添加导入
+try:
+    from utils.util import to_tensor
+except ImportError:
+    print("[警告] 无法从 utils.util 导入 to_tensor，将使用本地定义。")
+    # 如果导入失败，提供一个备用定义
+    def to_tensor(array):
+        return torch.from_numpy(np.array(array)).float()
+import os
+import random
+from types import SimpleNamespace # 确保导入 SimpleNamespace
 
 class CustomDataset(Dataset):
     def __init__(
@@ -12,114 +28,308 @@ class CustomDataset(Dataset):
             seqs_labels_path_pair
     ):
         super(CustomDataset, self).__init__()
+        # 存储 [(seq_path, label_path, subject_id), ...]
         self.seqs_labels_path_pair = seqs_labels_path_pair
 
     def __len__(self):
-        return len((self.seqs_labels_path_pair))
+        return len(self.seqs_labels_path_pair)
 
     def __getitem__(self, idx):
-        seq_path = self.seqs_labels_path_pair[idx][0]
-        label_path = self.seqs_labels_path_pair[idx][1]
-        subject_id = self.seqs_labels_path_pair[idx][2]
-        #print(seq_path)
-        seq_eeg = np.load(seq_path)[:, :1, :]
-        #print(seq_eeg.shape)
-        seq_eog = np.load(seq_path)[:, 1:2, :]
-        #print(seq_eog.shape)
-        seq = np.concatenate((seq_eeg, seq_eog), axis=1)
-        label = np.load(label_path)
+        seq_path, label_path, subject_id = self.seqs_labels_path_pair[idx]
+        # print(seq_path) # 调试时可以取消注释
+        try:
+            # 加载 EEG 和 EOG 通道
+            # 注意：这里假设 .npy 文件保存的是 (num_epochs_in_seq, num_channels, sequence_length)
+            # 并且 EEG 是第 0 通道，EOG 是第 1 通道
+            data = np.load(seq_path) # 预期形状 (20, 2, 3000)
+            seq_eeg = data[:, :1, :]
+            seq_eog = data[:, 1:2, :]
+            seq = np.concatenate((seq_eeg, seq_eog), axis=1) # 形状仍为 (20, 2, 3000)
+
+            label = np.load(label_path) # 预期形状 (20,)
+
+            # 数据类型转换（可选，但推荐）
+            seq = seq.astype(np.float32)
+            label = label.astype(np.int64) # CrossEntropyLoss 需要 Long 类型
+
+        except Exception as e:
+            print(f"[错误] 加载数据失败: seq_path='{seq_path}', label_path='{label_path}'. 错误: {e}")
+            # 返回占位符或引发异常，避免程序崩溃在后续处理上
+            # 这里我们返回 None，并在 collate 函数中处理
+            return None, None, None
+
         return seq, label, subject_id
 
     def collate(self, batch):
-        x_seq = np.array([x[0] for x in batch])
-        y_label = np.array([x[1] for x in batch])
-        z_label = np.array([x[2] for x in batch]) # subject id
-        return to_tensor(x_seq), to_tensor(y_label).long(), to_tensor(z_label).long()
+        # 过滤掉加载失败的样本 (None)
+        batch = [item for item in batch if item[0] is not None]
+        if not batch: # 如果整个批次都加载失败
+            return None, None, None # 或者根据需要返回空的 tensor
+
+        # 从有效样本中提取数据
+        x_seq = np.array([x[0] for x in batch])     # (batch_size, 20, 2, 3000)
+        y_label = np.array([x[1] for x in batch])   # (batch_size, 20)
+        z_label = np.array([x[2] for x in batch])   # (batch_size,) subject id
+
+        # 转换为 Tensor
+        x_tensor = to_tensor(x_seq)
+        y_tensor = to_tensor(y_label).long() # 确保标签是 Long 类型
+        z_tensor = to_tensor(z_label).long()
+
+        return x_tensor, y_tensor, z_tensor
 
 
 class LoadDataset(object):
-    def __init__(self, params):
+    def __init__(self, params: SimpleNamespace):
         self.params = params
-        self.datasets = {
+        # 数据集名称到 ID 的映射（用于分配 subject_id）
+        self.datasets_map = {
             'sleep-edfx': 0,
             'HMC': 1,
             'ISRUC': 2,
             'SHHS1': 3,
             'P2018': 4,
         }
-        # self.datasets = {
-        #     'HMC': 0,
-        #     'sleep-edfx': 1,
-        #     'ISRUC': 2,
-        #     'SHHS1': 3,
-        #     'P2018': 4,
-        # }
-        # self.datasets = {
-        #     'SHHS1': 0,
-        #     'HMC': 1,
-        #     'ISRUC': 2,
-        #     'sleep-edfx': 3,
-        #     'P2018': 4,
-        # }
-        self.targets_dirs = [f'{self.params.datasets_dir}/{item}' for item in self.datasets.keys() if item in self.params.target_domains]
-        self.source_dirs = [f'{self.params.datasets_dir}/{item}' for item in self.datasets.keys() if item not in self.params.target_domains]
-        print(self.targets_dirs)
-        print(self.source_dirs)
+        # 如果 datasets_map 中没有找到 params.datasets_dir 中的数据集名称，可以给一个默认的基础 ID
+        self.unknown_dataset_base_id = max(self.datasets_map.values()) + 1
+        self.max_samples_per_dataset = getattr(params, 'max_samples_per_dataset', None)  # None 表示无限制
+        # --- 新增：判断是 LODO 训练模式还是独立测试模式 ---
+        if hasattr(params, 'test_dataset') and params.test_dataset:
+            self.mode = 'test'
+            self.test_dataset_name = params.test_dataset
+            self.test_dir = f'{self.params.datasets_dir}/{self.test_dataset_name}'
+            print(f"[信息] LoadDataset 初始化为 '测试' 模式，测试数据集: {self.test_dataset_name}")
+            if not os.path.isdir(self.test_dir):
+                 raise FileNotFoundError(f"指定的测试数据集目录不存在: {self.test_dir}")
+            self.source_dirs = []
+            self.targets_dirs = [] # LODO 的 target 在测试模式下不用
+        else:
+            self.mode = 'lodo'
+            # 按原 LODO 逻辑区分源域和目标域
+            target_domains_list = params.target_domains.split(',') if isinstance(params.target_domains, str) else [params.target_domains] # 处理单个或多个目标域
+            self.targets_dirs = [f'{self.params.datasets_dir}/{item}' for item in self.datasets_map.keys() if item in target_domains_list]
+            self.source_dirs = [f'{self.params.datasets_dir}/{item}' for item in self.datasets_map.keys() if item not in target_domains_list]
+            print("[信息] LoadDataset 初始化为 'LODO' 模式")
+            print(f"  目标域 (LODO中的测试集): {self.targets_dirs}")
+            print(f"  源域 (训练/验证集): {self.source_dirs}")
+
 
     def get_data_loader(self):
-        source_domains, subject_id = self.load_path(self.source_dirs, 0)
-        target_domains, _ = self.load_path(self.targets_dirs, subject_id)
-        # print(len(target_domains), len(source_domains))
-        train_pairs, val_pairs = self.split_dataset(source_domains)
-        print(len(train_pairs), len(val_pairs), len(target_domains))
-        train_set = CustomDataset(train_pairs)
-        val_set = CustomDataset(val_pairs)
-        test_set = CustomDataset(target_domains) # target domains is test set
-        data_loader = {
-            'train': DataLoader(
-                train_set,
-                batch_size=self.params.batch_size,
-                collate_fn=train_set.collate,
-                shuffle=True,
-                num_workers=self.params.num_workers,
-                pin_memory=True,
-            ),
-            'val': DataLoader(
-                val_set,
-                batch_size=self.params.batch_size,
-                collate_fn=val_set.collate,
-                shuffle=True,
-                num_workers=self.params.num_workers,
-                pin_memory=True,
-            ),
-            'test': DataLoader(
-                test_set,
-                batch_size=self.params.batch_size,
-                collate_fn=test_set.collate,
-                shuffle=True,
-                num_workers=self.params.num_workers,
-                pin_memory=True,
-            ),
-        }
-        return data_loader, subject_id
+        # --- 根据模式加载数据 ---
+        if self.mode == 'test':
+            # --- 测试模式：只加载指定的测试数据集 ---
+            print(f"[信息] 加载测试数据从: {self.test_dir}")
+            test_pairs, _ = self.load_path([self.test_dir], start_subject_id=0) # 测试模式 id 从 0 开始
+            if not test_pairs:
+                print(f"[警告] 未能在 {self.test_dir} 中找到任何有效的 seq/label 文件对。")
+                test_set = CustomDataset([]) # 创建空数据集避免错误
+            else:
+                print(f"  找到 {len(test_pairs)} 个测试样本。")
+                test_set = CustomDataset(test_pairs)
 
-    def load_path(self, domains_dirs, subject_id):
-        domains = []
-        for dataset in domains_dirs:
-            seq_dirs = os.listdir(f'{dataset}/seq')
-            labels_dirs = os.listdir(f'{dataset}/labels')
-            for seq_dir, labels_dir in zip(seq_dirs, labels_dirs):
-                seq_names = os.listdir(os.path.join(dataset, 'seq', seq_dir))
-                labels_names = os.listdir(os.path.join(dataset, 'labels', labels_dir))
-                for seq_name, labels_name in zip(seq_names, labels_names):
-                    domains.append((os.path.join(dataset, 'seq', seq_dir, seq_name), os.path.join(dataset, 'labels', labels_dir, labels_name), subject_id))
-            subject_id += 1
-        return domains, subject_id
+            # 只返回 test loader
+            data_loader_dict = {
+                'train': None, # 或者返回一个空的 DataLoader
+                'val': None,   # 或者返回一个空的 DataLoader
+                'test': DataLoader(
+                    test_set,
+                    batch_size=self.params.batch_size,
+                    collate_fn=test_set.collate,
+                    shuffle=False, # 测试时通常不需要打乱
+                    num_workers=self.params.num_workers,
+                    pin_memory=True,
+                )
+            }
+            # 测试模式下，返回的 subject_id 通常无意义，可以返回 -1 或 None
+            return data_loader_dict, -1
 
-    def split_dataset(self, source_domains):
-        random.shuffle(source_domains)
-        split_num = int(len(source_domains) * 0.8)
-        train_pairs = source_domains[:split_num]
-        val_pairs = source_domains[split_num:]
+        elif self.mode == 'lodo':
+            # --- LODO 模式：按原来的逻辑加载 ---
+            print("[信息] 加载源域数据...")
+            source_domains_pairs, next_subject_id = self.load_path(self.source_dirs, start_subject_id=0)
+            print(f"  共加载 {len(source_domains_pairs)} 个源域样本，下一个 subject_id 为 {next_subject_id}")
+
+            print("[信息] 加载目标域数据...")
+            target_domains_pairs, final_subject_id = self.load_path(self.targets_dirs, start_subject_id=next_subject_id)
+            print(f"  共加载 {len(target_domains_pairs)} 个目标域样本，最终 subject_id 为 {final_subject_id -1}")
+
+            if not source_domains_pairs:
+                print("[警告] 未加载到任何源域数据，训练和验证集将为空。")
+                train_pairs, val_pairs = [], []
+            else:
+                train_pairs, val_pairs = self.split_dataset(source_domains_pairs)
+            print(f"  源域数据分割: {len(train_pairs)} 训练样本, {len(val_pairs)} 验证样本")
+
+            if not target_domains_pairs:
+                print("[警告] 未加载到任何目标域数据，测试集将为空。")
+                test_set = CustomDataset([])
+            else:
+                 test_set = CustomDataset(target_domains_pairs) # LODO 模式下目标域是测试集
+
+            train_set = CustomDataset(train_pairs)
+            val_set = CustomDataset(val_pairs)
+
+            # 返回包含 train, val, test 的 loader 字典
+            data_loader_dict = {
+                'train': DataLoader(
+                    train_set,
+                    batch_size=self.params.batch_size,
+                    collate_fn=train_set.collate,
+                    shuffle=True, # 训练时打乱
+                    num_workers=self.params.num_workers,
+                    pin_memory=True,
+                ),
+                'val': DataLoader(
+                    val_set,
+                    batch_size=self.params.batch_size,
+                    collate_fn=val_set.collate,
+                    shuffle=False, # 验证时通常不打乱
+                    num_workers=self.params.num_workers,
+                    pin_memory=True,
+                ),
+                'test': DataLoader(
+                    test_set,
+                    batch_size=self.params.batch_size,
+                    collate_fn=test_set.collate,
+                    shuffle=False, # 测试时通常不打乱
+                    num_workers=self.params.num_workers,
+                    pin_memory=True,
+                ),
+            }
+            # LODO 模式下返回最后一个分配的 subject_id
+            return data_loader_dict, final_subject_id
+
+        else:
+            raise ValueError(f"未知的 LoadDataset 模式: {self.mode}")
+
+    def load_path(self, domains_dirs, start_subject_id):
+        """
+        Carga pares de rutas de archivos seq y label de los directorios especificados.
+        Asigna un subject_id consecutivo para cada directorio de conjunto de datos.
+        Retorna: [(seq_path, label_path, subject_id), ...], next_subject_id
+        """
+        all_pairs = []
+        current_subject_id = start_subject_id
+        print(f"  Comenzando carga de rutas, subject_id inicial: {current_subject_id}")
+
+        for dataset_dir in domains_dirs:
+            dataset_name = Path(dataset_dir).name
+
+            # --- [FIX 1] Inicializar dataset_pairs aquí para evitar UnboundLocalError
+            dataset_pairs = []  # Almacenamiento temporal para los pares de archivos del conjunto de datos actual
+
+            # --- [FIX 2] Lógica corregida para la asignación de subject_id
+            if dataset_name in self.datasets_map:
+                subject_id = self.datasets_map[dataset_name]
+                print(f"    Cargando conjunto de datos '{dataset_name}' (ID: {subject_id}) desde: {dataset_dir}")
+                # Asegurar que current_subject_id esté por encima del ID predefinido más alto
+                current_subject_id = max(current_subject_id, max(self.datasets_map.values()) + 1)
+            else:
+                subject_id = current_subject_id
+                print(
+                    f"    Conjunto de datos '{dataset_name}' no encontrado en el mapeo predefinido, asignando nuevo ID: {subject_id}")
+                current_subject_id += 1  # Preparar el siguiente ID nuevo
+            # --- [FIN DEL FIX 2] ---
+
+            seq_base_path = os.path.join(dataset_dir, 'seq')
+            label_base_path = os.path.join(dataset_dir, 'labels')
+
+            if not os.path.isdir(seq_base_path) or not os.path.isdir(label_base_path):
+                print(
+                    f"    [Advertencia] No se encontraron subdirectorios 'seq' o 'labels' en {dataset_dir}, omitiendo este conjunto de datos.")
+                continue
+
+            # Iterar sobre las carpetas en el subdirectorio seq (ej. ISRUC-group1-1, ...)
+            try:
+                sub_dirs = sorted(
+                    [d for d in os.listdir(seq_base_path) if os.path.isdir(os.path.join(seq_base_path, d))])
+            except FileNotFoundError:
+                print(
+                    f"    [Advertencia] No se puede acceder al directorio {seq_base_path}, omitiendo este conjunto de datos.")
+                continue
+
+            if not sub_dirs:
+                print(
+                    f"    [Advertencia] No se encontraron subdirectorios en {seq_base_path}, buscando archivos .npy directamente.")
+                sub_dirs = ["."]  # Si no hay subdirectorios, buscar directamente en seq/
+
+            found_files_in_dataset = False
+            for sub_dir in sub_dirs:
+                current_seq_dir = os.path.join(seq_base_path, sub_dir)
+                current_label_dir = os.path.join(label_base_path, sub_dir)  # Asumir estructura idéntica
+
+                if not os.path.isdir(current_label_dir):
+                    print(
+                        f"    [Advertencia] No se encontró el directorio de etiquetas correspondiente {current_label_dir}, omitiendo subdirectorio {sub_dir}.")
+                    continue
+
+                try:
+                    seq_files = sorted([f for f in os.listdir(current_seq_dir) if f.endswith('.npy')])
+                    label_files = sorted([f for f in os.listdir(current_label_dir) if f.endswith('.npy')])
+                except FileNotFoundError:
+                    print(
+                        f"    [Advertencia] No se puede acceder al directorio {current_seq_dir} o {current_label_dir}, omitiendo subdirectorio {sub_dir}.")
+                    continue
+
+                # Coincidencia por nombre de archivo
+                label_files_dict = {f: os.path.join(current_label_dir, f) for f in label_files}
+
+                for seq_file in seq_files:
+                    if seq_file in label_files_dict:
+                        seq_path = os.path.join(current_seq_dir, seq_file)
+                        label_path = label_files_dict[seq_file]
+                        # Añadir al temporal dataset_pairs, no a all_pairs todavía
+                        dataset_pairs.append((seq_path, label_path, subject_id))
+                        found_files_in_dataset = True
+                    else:
+                        print(f"    [Advertencia] No se encontró archivo de etiqueta para '{seq_file}', omitido.")
+
+            if not found_files_in_dataset and sub_dirs == ["."]:
+                print(
+                    f"    [Advertencia] No se encontraron pares de archivos .npy en {seq_base_path} y {label_base_path}.")
+
+            # --- [FEATURE] Aplicar límite de muestras (Samples) aquí ---
+            # (Asegúrese de que self.max_samples_per_dataset se carga en __init__)
+            limit = None
+            if hasattr(self, 'max_samples_per_dataset') and self.max_samples_per_dataset is not None:
+                if isinstance(self.max_samples_per_dataset, dict):
+                    limit = self.max_samples_per_dataset.get(dataset_name)
+                elif isinstance(self.max_samples_per_dataset, int):
+                    limit = self.max_samples_per_dataset
+
+            if limit is not None and len(dataset_pairs) > limit:
+                print(
+                    f"    Conjunto de datos '{dataset_name}': Se encontraron {len(dataset_pairs)} muestras, limitando a {limit}.")
+                # Opcional: barajar antes de cortar
+                # random.shuffle(dataset_pairs)
+                dataset_pairs = dataset_pairs[:limit]
+
+            # Añadir los pares procesados (y posiblemente limitados) a la lista total
+            all_pairs.extend(dataset_pairs)
+            # --- Fin del feature ---
+
+        print(
+            f"  Carga de rutas finalizada, {len(all_pairs)} pares de archivos en total, próximo subject_id disponible: {current_subject_id}")
+        return all_pairs, current_subject_id
+
+    def split_dataset(self, source_domain_pairs, val_ratio=0.2, seed=None):
+        """
+        将源域数据分割为训练集和验证集。
+        默认按 80%/20% 分割。
+        可以传入 seed 以保证可复现性。
+        """
+        if seed is not None:
+            random.seed(seed) # 设置随机种子
+
+        # 复制列表以避免修改原始列表
+        shuffled_pairs = source_domain_pairs[:]
+        random.shuffle(shuffled_pairs)
+
+        split_num = int(len(shuffled_pairs) * (1 - val_ratio))
+        train_pairs = shuffled_pairs[:split_num]
+        val_pairs = shuffled_pairs[split_num:]
+
+        if seed is not None:
+             random.seed() # 恢复随机状态 (可选)
+
         return train_pairs, val_pairs
-

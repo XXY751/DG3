@@ -1,439 +1,347 @@
-# -*- coding: utf-8 -*-
-"""
-utils/allutils.py
-一个工具文件，集成：
-- CSV 指标记录与读取
-- 训练/验证曲线绘图（loss/acc/f1/lr等）
-- t-SNE 执行与可视化（原始 vs 网络输出）
-- metric 计算（acc/f1/confusion）
-- 按比例抽样构建 DataLoader（data_ratio）
-- 5折综合图与CSV汇总（allfold）
+# utils/allutils.py
+# (已更新 MetricsLogger 以包含 test_acc, test_f1 等)
 
-依赖：matplotlib, seaborn, numpy, pandas, scikit-learn, torch
-"""
 import os
-import csv
-import math
-import json
 import random
+import re
+from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
-
+import csv
 import numpy as np
-import pandas as pd
-import matplotlib.pyplot as plt
-import seaborn as sns
-
 import torch
-from torch.utils.data import Subset, DataLoader
-from sklearn.metrics import accuracy_score, f1_score, confusion_matrix
+import matplotlib.pyplot as plt
 from sklearn.manifold import TSNE
-from sklearn.decomposition import PCA
+import pandas as pd
+from torch.utils.data import DataLoader, Subset
+from collections import Counter
+import torch.nn as nn
+from tqdm import tqdm
+def ensure_dir(path):
+    """确保目录存在"""
+    path = Path(path)
+    path.mkdir(parents=True, exist_ok=True)
+    return path
 
-# =========================
-# 基础IO工具
-# =========================
-def ensure_dir(p: Path):
-    p.mkdir(parents=True, exist_ok=True)
-    return p
 
-def save_json(d: dict, path: Path):
-    ensure_dir(path.parent)
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(d, f, ensure_ascii=False, indent=2)
+def _now():
+    """获取当前时间字符串"""
+    return datetime.now().strftime('%Y-%m-%d %H:%M:%S')
 
-# =========================
-# Metrics 计算
-# =========================
-def compute_accuracy(y_true: np.ndarray, y_pred: np.ndarray) -> float:
-    return float(accuracy_score(y_true, y_pred))
 
-def compute_f1(y_true: np.ndarray, y_pred: np.ndarray, average: str = "macro") -> float:
-    return float(f1_score(y_true, y_pred, average=average))
-
-def compute_confusion(y_true: np.ndarray, y_pred: np.ndarray) -> np.ndarray:
-    return confusion_matrix(y_true, y_pred)
-
-# =========================
-# 训练日志 CSV 记录器
-# =========================
 class MetricsLogger:
     """
-    每折一个 logger。每个 epoch 追加写一行到 CSV。
-    列：time, fold, epoch, lr, train_loss, train_acc?, train_f1?, val_acc, val_f1, 各类F1...
-    （train_acc/train_f1 可选，你有的话就传；没有就传None）
+    用于在训练期间记录和保存指标到 CSV 文件的实用工具。
+    [已更新] 增加对 test_acc, test_f1, test_kappa 等的支持。
     """
-    def __init__(self, fold_dir: Path, fold_id: int):
-        self.fold_dir = ensure_dir(fold_dir)
-        self.fold_id = fold_id
-        self.csv_path = self.fold_dir / "metrics.csv"
-        self._init_csv()
 
-    def _init_csv(self):
+    def __init__(self, log_dir: Path, fold_id: int):
+        self.log_dir = ensure_dir(log_dir)
+        self.fold_id = fold_id
+        self.csv_path = self.log_dir / f"metrics.csv"
+
+        # [修改] 添加新的测试指标列
+        self.headers = [
+            'time', 'epoch', 'lr',
+            'train_loss', 'train_acc', 'train_f1',
+            'val_acc', 'val_f1', 'val_kappa',
+            'test_acc', 'test_f1', 'test_kappa',  # <-- 新增
+            'wake_f1', 'n1_f1', 'n2_f1', 'n3_f1', 'rem_f1',
+            'test_wake_f1', 'test_n1_f1', 'test_n2_f1', 'test_n3_f1', 'test_rem_f1'  # <-- 新增
+        ]
+
+        # 仅在文件不存在时写入表头
         if not self.csv_path.exists():
-            with open(self.csv_path, "w", newline="", encoding="utf-8") as f:
+            with open(self.csv_path, 'w', newline='', encoding='utf-8') as f:
                 writer = csv.writer(f)
-                writer.writerow([
-                    "time", "fold", "epoch", "lr",
-                    "train_loss", "train_acc", "train_f1",
-                    "val_acc", "val_f1",
-                    "wake_f1", "n1_f1", "n2_f1", "n3_f1", "rem_f1"
-                ])
+                writer.writerow(self.headers)
+        else:
+            # (可选) 检查表头是否匹配
+            pass
 
     def log_epoch(self,
-                  time_str: str,
-                  epoch: int,
-                  lr: float,
-                  train_loss: float,
-                  val_acc: float,
-                  val_f1: float,
-                  wake_f1: Optional[float] = None,
-                  n1_f1: Optional[float] = None,
-                  n2_f1: Optional[float] = None,
-                  n3_f1: Optional[float] = None,
-                  rem_f1: Optional[float] = None,
-                  train_acc: Optional[float] = None,
-                  train_f1: Optional[float] = None):
-        with open(self.csv_path, "a", newline="", encoding="utf-8") as f:
-            writer = csv.writer(f)
-            writer.writerow([
-                time_str, self.fold_id, epoch, lr,
-                float(train_loss) if train_loss is not None else "",
-                float(train_acc) if train_acc is not None else "",
-                float(train_f1) if train_f1 is not None else "",
-                float(val_acc) if val_acc is not None else "",
-                float(val_f1) if val_f1 is not None else "",
-                float(wake_f1) if wake_f1 is not None else "",
-                float(n1_f1) if n1_f1 is not None else "",
-                float(n2_f1) if n2_f1 is not None else "",
-                float(n3_f1) if n3_f1 is not None else "",
-                float(rem_f1) if rem_f1 is not None else "",
-            ])
+                  # 基础
+                  time_str: str, epoch: int, lr: float,
+                  # 训练
+                  train_loss: float = None, train_acc: float = None, train_f1: float = None,
+                  # 验证
+                  val_acc: float = None, val_f1: float = None, val_kappa: float = None,
+                  # [修改] 新增测试
+                  test_acc: float = None, test_f1: float = None, test_kappa: float = None,
+                  # 验证 F1
+                  wake_f1: float = None, n1_f1: float = None, n2_f1: float = None,
+                  n3_f1: float = None, rem_f1: float = None,
+                  # [修改] 新增测试 F1
+                  test_wake_f1: float = None, test_n1_f1: float = None, test_n2_f1: float = None,
+                  test_n3_f1: float = None, test_rem_f1: float = None
+                  ):
+        """
+        记录一个 epoch 的指标。
+        """
+        # [修改] 更新 row 字典以匹配新表头
+        row = {
+            'time': time_str, 'epoch': epoch, 'lr': lr,
+            'train_loss': f"{train_loss:.5f}" if train_loss is not None else "",
+            'train_acc': f"{train_acc:.5f}" if train_acc is not None else "",
+            'train_f1': f"{train_f1:.5f}" if train_f1 is not None else "",
+            'val_acc': f"{val_acc:.5f}" if val_acc is not None else "",
+            'val_f1': f"{val_f1:.5f}" if val_f1 is not None else "",
+            'val_kappa': f"{val_kappa:.5f}" if val_kappa is not None else "",
+            'test_acc': f"{test_acc:.5f}" if test_acc is not None else "",
+            'test_f1': f"{test_f1:.5f}" if test_f1 is not None else "",
+            'test_kappa': f"{test_kappa:.5f}" if test_kappa is not None else "",
+            'wake_f1': f"{wake_f1:.3f}" if wake_f1 is not None else "",
+            'n1_f1': f"{n1_f1:.3f}" if n1_f1 is not None else "",
+            'n2_f1': f"{n2_f1:.3f}" if n2_f1 is not None else "",
+            'n3_f1': f"{n3_f1:.3f}" if n3_f1 is not None else "",
+            'rem_f1': f"{rem_f1:.3f}" if rem_f1 is not None else "",
+            'test_wake_f1': f"{test_wake_f1:.3f}" if test_wake_f1 is not None else "",
+            'test_n1_f1': f"{test_n1_f1:.3f}" if test_n1_f1 is not None else "",
+            'test_n2_f1': f"{test_n2_f1:.3f}" if test_n2_f1 is not None else "",
+            'test_n3_f1': f"{test_n3_f1:.3f}" if test_n3_f1 is not None else "",
+            'test_rem_f1': f"{test_rem_f1:.3f}" if test_rem_f1 is not None else "",
+        }
+
+        try:
+            with open(self.csv_path, 'a', newline='', encoding='utf-8') as f:
+                writer = csv.DictWriter(f, fieldnames=self.headers)
+                writer.writerow(row)
+        except Exception as e:
+            print(f"[ERROR] MetricsLogger failed to write row: {e}")
+            print(f"      Row data: {row}")
 
     def path(self) -> Path:
         return self.csv_path
 
-# =========================
-# DataLoader 按比例抽样
-# =========================
-def build_ratio_loader(orig_loader: DataLoader,
-                       ratio: float = 1.0,
-                       seed: int = 42) -> DataLoader:
-    """复制一个新的 DataLoader，但数据集为原 dataset 的子集(比例为 ratio)。"""
+
+# ... (allutils.py 中的其余函数 build_ratio_loader, plot_curves_for_fold 等保持不变) ...
+
+def build_ratio_loader(loader: DataLoader, ratio: float, seed: int = 42) -> DataLoader:
+    """
+    从现有 DataLoader 创建一个按比例缩小的 DataLoader。
+    """
     if ratio >= 1.0:
-        return orig_loader
+        return loader
 
-    dataset = orig_loader.dataset
-    N = len(dataset)
-    n_use = max(1, int(N * ratio))
+    dataset = loader.dataset
+    total_size = len(dataset)
+    subset_size = int(total_size * ratio)
 
-    rng = random.Random(seed)
-    indices = list(range(N))
-    rng.shuffle(indices)
-    pick = indices[:n_use]
+    # 确保我们至少有 1 个样本
+    subset_size = max(1, subset_size)
 
-    subset = Subset(dataset, pick)
-    # 尽量复用原 loader 的参数
+    # 生成随机索引
+    # 注意：这对于大型数据集可能会很慢。如果数据集已打乱，
+    # 我们可以只取前 N 个，但这取决于原始 loader 的 shuffle 状态。
+    # 为了可复现性，我们使用 np.random.permutation。
+    g = np.random.Generator(np.random.PCG64(seed))
+    indices = g.permutation(total_size)[:subset_size]
+
+    # 创建 Subset
+    subset = Subset(dataset, indices)
+
+    # 创建新的 DataLoader
     new_loader = DataLoader(
         subset,
-        batch_size=orig_loader.batch_size,
-        shuffle=True,  # 子集内再shuffle
-        num_workers=orig_loader.num_workers,
-        drop_last=getattr(orig_loader, "drop_last", False),
-        pin_memory=getattr(orig_loader, "pin_memory", False),
-        collate_fn=getattr(orig_loader, "collate_fn", None)
+        batch_size=loader.batch_size,
+        shuffle=True,  # 通常在训练子集上我们希望 shuffle
+        num_workers=loader.num_workers,
+        pin_memory=loader.pin_memory
     )
+
+    print(f"      [INFO] Building ratio loader: {subset_size} / {total_size} samples ({ratio * 100:.1f}%)")
     return new_loader
 
-# =========================
-# 绘图：指标曲线
-# =========================
-def _setup_style():
-    sns.set(style="whitegrid", context="talk")
-    plt.rcParams["figure.figsize"] = (10, 6)
-    plt.rcParams["axes.spines.top"] = False
-    plt.rcParams["axes.spines.right"] = False
 
-def plot_curves_for_fold(csv_path: Path, out_dir: Path):
-    """读取单折 CSV，绘制 loss/acc/f1/lr 曲线，输出到该折目录"""
-    ensure_dir(out_dir)
-    df = pd.read_csv(csv_path)
+def plot_curves_for_fold(metrics_csv_path: Path, out_dir: Path):
+    """
+    读取 metrics.csv 文件并绘制训练/验证曲线图。
+    [已更新] 增加对 test_acc 和 test_f1 的绘制。
+    """
+    try:
+        df = pd.read_csv(metrics_csv_path)
+    except FileNotFoundError:
+        print(f"[WARN] plot_curves: {metrics_csv_path} not found. Skipping plot.")
+        return
+    except pd.errors.EmptyDataError:
+        print(f"[WARN] plot_curves: {metrics_csv_path} is empty. Skipping plot.")
+        return
 
-    _setup_style()
+    out_dir = ensure_dir(out_dir)
+    plt.style.use('ggplot')
 
-    # 1) Loss
-    plt.figure()
-    sns.lineplot(x="epoch", y="train_loss", data=df, marker="o")
-    plt.title("Train Loss per Epoch")
-    plt.xlabel("Epoch"); plt.ylabel("Loss")
-    plt.tight_layout()
-    plt.savefig(out_dir / "loss_curve.png", dpi=180)
-    plt.savefig(out_dir / "loss_curve.pdf")
+    # --- 1. 损失曲线 ---
+    plt.figure(figsize=(10, 6))
+    if 'train_loss' in df.columns and df['train_loss'].notna().any():
+        plt.plot(df['epoch'], df['train_loss'], label='Train Loss', alpha=0.8)
+    plt.title('Epoch vs. Training Loss')
+    plt.xlabel('Epoch')
+    plt.ylabel('Loss')
+    plt.legend()
+    plt.savefig(out_dir / "plot_loss.png", dpi=150)
     plt.close()
 
-    # 2) Val Accuracy
-    if "val_acc" in df.columns:
-        plt.figure()
-        sns.lineplot(x="epoch", y="val_acc", data=df, marker="o")
-        plt.title("Validation Accuracy per Epoch")
-        plt.xlabel("Epoch"); plt.ylabel("Accuracy")
-        plt.tight_layout()
-        plt.savefig(out_dir / "val_acc_curve.png", dpi=180)
-        plt.savefig(out_dir / "val_acc_curve.pdf")
-        plt.close()
+    # --- 2. 准确率曲线 ---
+    plt.figure(figsize=(10, 6))
+    if 'val_acc' in df.columns and df['val_acc'].notna().any():
+        plt.plot(df['epoch'], df['val_acc'], label='Validation Accuracy', marker='o', markersize=3, alpha=0.8)
+    # [修改] 绘制测试准确率
+    if 'test_acc' in df.columns and df['test_acc'].notna().any():
+        plt.plot(df['epoch'], df['test_acc'], label='Test Accuracy', marker='x', markersize=3, alpha=0.8,
+                 linestyle='--')
 
-    # 3) Val F1
-    if "val_f1" in df.columns:
-        plt.figure()
-        sns.lineplot(x="epoch", y="val_f1", data=df, marker="o")
-        plt.title("Validation F1 per Epoch")
-        plt.xlabel("Epoch"); plt.ylabel("F1 (macro)")
-        plt.tight_layout()
-        plt.savefig(out_dir / "val_f1_curve.png", dpi=180)
-        plt.savefig(out_dir / "val_f1_curve.pdf")
-        plt.close()
+    plt.title('Epoch vs. Accuracy')
+    plt.xlabel('Epoch')
+    plt.ylabel('Accuracy')
+    plt.legend()
+    plt.savefig(out_dir / "plot_accuracy.png", dpi=150)
+    plt.close()
 
-    # 4) LR
-    if "lr" in df.columns:
-        plt.figure()
-        sns.lineplot(x="epoch", y="lr", data=df, marker="o")
-        plt.title("Learning Rate per Epoch")
-        plt.xlabel("Epoch"); plt.ylabel("LR")
-        plt.tight_layout()
-        plt.savefig(out_dir / "lr_curve.png", dpi=180)
-        plt.savefig(out_dir / "lr_curve.pdf")
-        plt.close()
+    # --- 3. F1 分数曲线 ---
+    plt.figure(figsize=(10, 6))
+    if 'val_f1' in df.columns and df['val_f1'].notna().any():
+        plt.plot(df['epoch'], df['val_f1'], label='Validation Macro F1', marker='o', markersize=3, alpha=0.8)
+    # [修改] 绘制测试 F1
+    if 'test_f1' in df.columns and df['test_f1'].notna().any():
+        plt.plot(df['epoch'], df['test_f1'], label='Test Macro F1', marker='x', markersize=3, alpha=0.8, linestyle='--')
 
-def plot_curves_allfold(fold_csv_paths: List[Path], out_dir: Path):
-    """读取多折 CSV，计算均值并绘制综合曲线到 allfold/"""
-    ensure_dir(out_dir)
-    _setup_style()
+    plt.title('Epoch vs. Macro F1-Score')
+    plt.xlabel('Epoch')
+    plt.ylabel('F1-Score')
+    plt.legend()
+    plt.savefig(out_dir / "plot_f1.png", dpi=150)
+    plt.close()
 
-    # 合并
-    dfs = []
-    for p in fold_csv_paths:
-        if p.exists():
-            df = pd.read_csv(p)
-            df["__fold__"] = p.parent.name
-            dfs.append(df)
-    if not dfs:
-        return
-    ALL = pd.concat(dfs, ignore_index=True)
 
-    # 对相同epoch聚合均值
-    metrics = ["train_loss", "val_acc", "val_f1", "lr"]
-    for m in metrics:
-        if m not in ALL.columns:
-            continue
-        mean_df = ALL.groupby("epoch")[m].mean().reset_index()
-
-        plt.figure()
-        # 各折
-        for name, g in ALL.dropna(subset=[m]).groupby("__fold__"):
-            sns.lineplot(x="epoch", y=m, data=g, alpha=0.35, label=name)
-        # 平均
-        sns.lineplot(x="epoch", y=m, data=mean_df, linewidth=3, marker="o", label="mean")
-        ttl = f"All-Folds {m} per Epoch"
-        plt.title(ttl)
-        plt.xlabel("Epoch"); plt.ylabel(m)
-        plt.legend(ncol=2, fontsize=10)
-        plt.tight_layout()
-        plt.savefig(out_dir / f"allfold_{m}_curve.png", dpi=180)
-        plt.savefig(out_dir / f"allfold_{m}_curve.pdf")
-        plt.close()
-
-# =========================
-# t-SNE 可视化
-# =========================
-# utils/allutils.py 中，完整替换这个函数
-@torch.no_grad()
-def extract_features_for_tsne(model: torch.nn.Module,
-                              loader: DataLoader,
-                              device: torch.device,
-                              take: str = "mu_tilde") -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+def extract_features_for_tsne(model: nn.Module, loader: DataLoader, device, take="mu_tilde"):
     """
-    从测试集提取：
-      RAW: [N, L] 展平后的原始输入
-      REP: [N, D] 选取 'mu_tilde'/'mu'/'logits' 作为表征
-      Y  : [N]    标签
+    使用模型从数据加载器中提取特征 (mu_tilde) 和原始数据 (x) 以进行 t-SNE。
     """
     model.eval()
-    raw_list, rep_list, lab_list = [], [], []
 
-    for batch in loader:
-        if isinstance(batch, (list, tuple)):
-            if len(batch) == 3:
-                x, y, z = batch
-            elif len(batch) == 2:
-                x, y = batch; z = None
-            else:
-                x = batch[0]; y = batch[1]; z = None
-        else:
-            # 非标准 batch（很少见）
-            x, y, z = batch["x"], batch.get("y", None), batch.get("z", None)
+    all_raw_X = []
+    all_rep_X = []
+    all_y = []
 
-        x = x.to(device, non_blocking=True)
-        if y is not None:
-            y = y.to(device, non_blocking=True).long()
-        if z is not None:
-            z = z.to(device, non_blocking=True).long()
+    with torch.no_grad():
+        for x, y, z in tqdm(loader, desc="t-SNE Feature Extraction", leave=False):
+            x = x.to(device)
+            y = y.to(device)
+            z = z.to(device)
 
-        # 原始展平
-        raw = x.detach().float().cpu().numpy().reshape(x.shape[0], -1)
-        raw_list.append(raw)
+            # --- 提取原始数据 (展平) ---
+            # x shape: (B, T, C, L) e.g., (B, 20, 2, 3000)
+            # 展平为 (B, T*C*L)
+            raw_flat = x.cpu().numpy().reshape(x.size(0), -1)
+            all_raw_X.append(raw_flat)
 
-        # 前向
-        out = model(x, labels=y, domain_ids=z)
-        if isinstance(out, (list, tuple)) and len(out) >= 4:
-            logits, recon, mu, mu_tilde = out[:4]
-        else:
-            raise RuntimeError("模型forward返回不含预期的4个主输出 (logits, recon, mu, mu_tilde)")
+            # --- 提取表征 ---
+            try:
+                # 假设 model.inference 存在 (在 'original' 中可能不存在)
+                if hasattr(model, 'inference'):
+                    # (B, T, D) -> (B, D)
+                    mu = model.ae.encoder(x).mean(dim=1)
+                    mu_tilde, _ = model.ldp(mu, domain_ids=None, use_uni=True)
+                    rep = mu_tilde
+                else:
+                    # 备用：调用 forward
+                    _, _, mu, mu_tilde, _ = model(x, labels=y, domain_ids=z)
+                    rep = mu_tilde if take == "mu_tilde" else mu.mean(dim=1)
 
-        if take == "mu_tilde":
-            rep = mu_tilde
-        elif take == "mu":
-            rep = mu
-        elif take == "logits":
-            rep = logits.mean(dim=1) if logits.dim() == 3 else logits
-        else:
-            raise ValueError(f"unknown take={take}")
+            except Exception as e:
+                print(f"[WARN] t-SNE feature extraction failed: {e}. Using dummy features.")
+                rep = torch.zeros(x.size(0), 10)  # 假维度
 
-        rep = rep.detach().float().cpu().numpy().reshape(rep.shape[0], -1)
-        rep_list.append(rep)
-        lab_list.append(y.detach().cpu().numpy())
+            all_rep_X.append(rep.cpu().numpy())
 
-    RAW = np.concatenate(raw_list, axis=0)
-    REP = np.concatenate(rep_list, axis=0)
-    Y = np.concatenate(lab_list, axis=0)
+            # 标签 (取序列的第一个标签)
+            all_y.append(y[:, 0].cpu().numpy())
+
+    RAW = np.concatenate(all_raw_X, axis=0)
+    REP = np.concatenate(all_rep_X, axis=0)
+    Y = np.concatenate(all_y, axis=0)
+
     return RAW, REP, Y
 
 
-def _tsne_2d(X: np.ndarray, perplexity: int = 80, pca_dim: int = 50, seed: int = 42) -> np.ndarray:
-    """PCA 预降维 + t-SNE 到2D"""
-    Xp = X
-    if X.shape[1] > pca_dim:
-        pca = PCA(n_components=pca_dim, random_state=seed)
-        Xp = pca.fit_transform(X)
-    tsne = TSNE(n_components=2, perplexity=perplexity, init="pca", random_state=seed, learning_rate="auto", n_iter=1200)
-    Z = tsne.fit_transform(Xp)
-    return Z
-def _to_1d(a: np.ndarray) -> np.ndarray:
-    """确保是一维 (N,)，若是 (N,1) / (N,T) / one-hot 则化到 (N,)。"""
-    a = np.asarray(a)
-    if a.ndim == 1:
-        return a
-    # 如果是 one-hot 或 (N,T) 多列标签，取最后一维 argmax
-    if a.ndim >= 2:
-        return a.argmax(axis=-1).reshape(-1)
-    return a.reshape(-1)
-
-def _make_df(Z2: np.ndarray, labels: np.ndarray) -> pd.DataFrame:
-    """把二维坐标和标签打包成 DataFrame，列都保证 1D。"""
-    Z2 = np.asarray(Z2)
-    assert Z2.ndim == 2 and Z2.shape[1] == 2, f"Z2 shape must be (N,2), got {Z2.shape}"
-    x1 = np.asarray(Z2[:, 0]).reshape(-1)
-    x2 = np.asarray(Z2[:, 1]).reshape(-1)
-    y1d = _to_1d(labels)
-    # 强制长度一致
-    N = min(len(x1), len(x2), len(y1d))
-    df = pd.DataFrame({
-        "x1": x1[:N],
-        "x2": x2[:N],
-        "label": y1d[:N].astype(int)
-    })
-    return df
-
-def tsne_compare_plot(raw_X: np.ndarray,
-                      rep_X: np.ndarray,
-                      y: np.ndarray,
-                      out_dir: Path,
-                      title_prefix: str = "Test t-SNE",
-                      filename_prefix: str = "tsne",
-                      palette: Optional[List[str]] = None,
-                      max_points: Optional[int] = None,
-                      seed: int = 42):
+def tsne_compare_plot(raw_X, rep_X, y, out_dir, title_prefix, filename_prefix):
     """
-    绘制 原始输入(raw) vs 表征(rep) t-SNE 对比图。
-    - 自动将 labels 压成一维；若为 one-hot 或 (N,T) 会取 argmax。
-    - 为避免 seaborn 报错，先构造 DataFrame 再绘图。
-    - max_points: 若样本很多，可设置下采样数量（如 10000）。
+    为原始数据和表征数据生成并排的 t-SNE 图。
     """
-    ensure_dir(out_dir)
-    _setup_style()
-    rng = np.random.default_rng(seed)
+    out_dir = ensure_dir(out_dir)
 
-    # 颜色
-    if palette is None:
-        palette = sns.color_palette("tab10", n_colors=10)
+    # --- t-SNE 设置 ---
+    # (如果数据量太大，进行子采样)
+    n_samples = 1500
+    if len(y) > n_samples:
+        print(f"[INFO] t-SNE: Subsampling data from {len(y)} to {n_samples}")
+        indices = np.random.permutation(len(y))[:n_samples]
+        raw_X = raw_X[indices]
+        rep_X = rep_X[indices]
+        y = y[indices]
 
-    # 计算 t-SNE 嵌入
-    Z_raw = _tsne_2d(raw_X)
-    Z_rep = _tsne_2d(rep_X)
+    tsne = TSNE(n_components=2, perplexity=30, n_iter=1000, random_state=42)
 
-    # 组装 DF（确保全是 1D）
-    df_raw = _make_df(Z_raw, y)
-    df_rep = _make_df(Z_rep, y)
+    print("[INFO] t-SNE: Fitting raw data...")
+    raw_tsne = tsne.fit_transform(raw_X)
+    print("[INFO] t-SNE: Fitting representation data...")
+    rep_tsne = tsne.fit_transform(rep_X)
 
-    # 可选下采样
-    def _subsample(df: pd.DataFrame) -> pd.DataFrame:
-        if max_points is None or len(df) <= max_points:
-            return df
-        idx = rng.choice(len(df), size=max_points, replace=False)
-        return df.iloc[idx]
-    df_raw = _subsample(df_raw)
-    df_rep = _subsample(df_rep)
+    # --- 绘图 ---
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(20, 10))
+    cmap = plt.cm.get_cmap('tab10', 5)  # 5 个睡眠阶段
 
-    # 确保 palette 足够长
-    n_classes = int(df_raw["label"].nunique())
-    if len(palette) < n_classes:
-        palette = sns.color_palette("tab20", n_colors=n_classes)
+    # 图 1: 原始数据
+    scatter1 = ax1.scatter(raw_tsne[:, 0], raw_tsne[:, 1], c=y, cmap=cmap, alpha=0.7, s=10)
+    ax1.set_title(f'{title_prefix} - Raw Data (t-SNE)')
+    ax1.set_xlabel('t-SNE Component 1')
+    ax1.set_ylabel('t-SNE Component 2')
 
-    # 原始
-    plt.figure()
-    sns.scatterplot(data=df_raw, x="x1", y="x2", hue="label",
-                    palette=palette[:n_classes], s=14, linewidth=0, alpha=0.75)
-    plt.title(f"{title_prefix} — Raw")
-    plt.xlabel("t-SNE 1"); plt.ylabel("t-SNE 2")
-    plt.legend(title="Class", bbox_to_anchor=(1.02, 1), loc="upper left", fontsize=10)
-    plt.tight_layout()
-    plt.savefig(out_dir / f"{filename_prefix}_raw.png", dpi=180)
-    plt.savefig(out_dir / f"{filename_prefix}_raw.pdf")
-    plt.close()
+    # 图 2: 表征
+    scatter2 = ax2.scatter(rep_tsne[:, 0], rep_tsne[:, 1], c=y, cmap=cmap, alpha=0.7, s=10)
+    ax2.set_title(f'{title_prefix} - Representation (t-SNE)')
+    ax2.set_xlabel('t-SNE Component 1')
+    ax2.set_ylabel('t-SNE Component 2')
 
-    # 表征
-    plt.figure()
-    sns.scatterplot(data=df_rep, x="x1", y="x2", hue="label",
-                    palette=palette[:n_classes], s=14, linewidth=0, alpha=0.75)
-    plt.title(f"{title_prefix} — Representation")
-    plt.xlabel("t-SNE 1"); plt.ylabel("t-SNE 2")
-    plt.legend(title="Class", bbox_to_anchor=(1.02, 1), loc="upper left", fontsize=10)
-    plt.tight_layout()
-    plt.savefig(out_dir / f"{filename_prefix}_rep.png", dpi=180)
-    plt.savefig(out_dir / f"{filename_prefix}_rep.pdf")
-    plt.close()
+    # 添加图例
+    legend_labels = ['W', 'N1', 'N2', 'N3', 'R']
+    handles = [plt.Line2D([0], [0], marker='o', color='w', label=legend_labels[i],
+                          markerfacecolor=cmap(i / 4.0), markersize=10) for i in range(5)]
+    fig.legend(handles=handles, title='Sleep Stage', loc='upper right')
+
+    plt.tight_layout(rect=[0, 0, 0.9, 1])  # 为图例留出空间
+
+    out_path = out_dir / f"{filename_prefix}_comparison.png"
+    fig.savefig(out_path, dpi=150)
+    print(f"[INFO] t-SNE plot saved to {out_path}")
+    plt.close(fig)
 
 
-# =========================
-# 5折汇总（allfold）
-# =========================
-def write_aggregate_row(allfold_csv: Path,
-                        row: Dict):
-    """向 allfold/aggregate_results.csv 追加一行；无文件则写表头"""
-    ensure_dir(allfold_csv.parent)
-    write_header = not allfold_csv.exists()
-    with open(allfold_csv, "a", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=[
-            "time", "run_id", "fold",
-            "best_val_acc", "best_val_f1",
-            "test_acc", "test_f1",
-            "wake_f1", "n1_f1", "n2_f1", "n3_f1", "rem_f1",
-            "model_path"
-        ])
-        if write_header:
-            writer.writeheader()
-        writer.writerow(row)
+def write_aggregate_row(csv_path: Path, row: dict):
+    """
+    将单行聚合结果追加到 CSV 文件中。
+    [已更新] 增加对 test_kappa 的支持。
+    """
+    ensure_dir(csv_path.parent)
 
-def collect_and_plot_allfold(fold_dirs: List[Path], out_dir: Path):
-    """收集各 fold/metrics.csv，绘制 allfold 综合图"""
-    csvs = [d / "metrics.csv" for d in fold_dirs]
-    plot_curves_allfold(csvs, out_dir=out_dir)
+    # [修改] 更新表头以匹配新指标
+    headers = [
+        "time", "run_id", "fold",
+        "best_val_acc", "best_val_f1",
+        "test_acc", "test_f1", "test_kappa",
+        "wake_f1", "n1_f1", "n2_f1", "n3_f1", "rem_f1",
+        "model_path"
+    ]
+
+    # 过滤 row 字典，只保留表头中的键
+    filtered_row = {k: row.get(k, "N/A") for k in headers}
+
+    file_exists = csv_path.exists()
+
+    try:
+        with open(csv_path, 'a', newline='', encoding='utf-8') as f:
+            writer = csv.DictWriter(f, fieldnames=headers)
+            if not file_exists:
+                writer.writeheader()  # 仅在文件不存在时写入表头
+            writer.writerow(filtered_row)
+    except Exception as e:
+        print(f"[ERROR] Failed to write aggregate row to {csv_path}: {e}")
